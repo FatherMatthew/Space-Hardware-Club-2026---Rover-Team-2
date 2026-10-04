@@ -1,5 +1,6 @@
 import sys
 import random
+import time
 from datetime import datetime
 from collections import deque
 
@@ -15,15 +16,22 @@ from PyQt5.QtWidgets import (
     QGridLayout,
     QVBoxLayout,
     QHBoxLayout,
+    QDoubleSpinBox,
 )
 
 import pyqtgraph as pg
 
-
 class GroundStation(QMainWindow):
 
-    def __init__(self):
+    def __init__(self, demo=False):
         super().__init__()
+        self.demo = demo
+        self.ros = None
+        self.arm_buttons = []
+        self.last_arm_status = None
+        self.angle_inputs = {}
+        self.target_synced = set()
+        self.started = time.monotonic()
 
         self.setWindowTitle("Rover Control Station")
         self.resize(1300, 800)
@@ -43,15 +51,28 @@ class GroundStation(QMainWindow):
         self.counter = 0
 
         self.build_ui()
-        self.start_demo_telemetry()
-
         self.log("Ground station initialized")
-        self.log("DEMO MODE - ROS 2 not connected")
-
-
-    # =========================================================
-    # MAIN UI
-    # =========================================================
+        if self.demo:
+            self.preview_status = {
+                "ready": True, "enabled": False, "mode": "simulation",
+                "targets": {axis: 90 for axis in ("Base", "Shoulder", "Elbow", "Wrist", "Gripper")},
+                "limits": {axis: [0, 180] for axis in ("Base", "Shoulder", "Elbow", "Wrist", "Gripper")},
+                "note": "Local UI preview only",
+            }
+            self.start_demo_telemetry()
+            self.log("LOCAL DEMO: fake sensors, no ROS 2 or hardware")
+            self.receive_arm_status(self.preview_status)
+        else:
+            if __package__:
+                from .ground_station_ros import GroundStationROS
+            else:
+                from ground_station_ros import GroundStationROS
+            self.ros = GroundStationROS(self.receive_arm_status, self.receive_sensor_data)
+            self.connection.setText("WAITING FOR ARM BRIDGE")
+            self.log("ROS 2 started; waiting for arm status. Sensors are not connected.")
+            self.ros_timer = QTimer(self)
+            self.ros_timer.timeout.connect(self.poll_ros)
+            self.ros_timer.start(20)
 
     def build_ui(self):
 
@@ -59,8 +80,6 @@ class GroundStation(QMainWindow):
         self.setCentralWidget(central)
 
         main_layout = QVBoxLayout(central)
-
-        # ---------------- HEADER ----------------
 
         header = QHBoxLayout()
 
@@ -77,40 +96,26 @@ class GroundStation(QMainWindow):
 
         main_layout.addLayout(header)
 
-
-        # ---------------- MAIN AREA ----------------
-
         content = QHBoxLayout()
 
         # Left side
         left_column = QVBoxLayout()
 
-        left_column.addWidget(
-            self.create_drive_panel()
-        )
+        left_column.addWidget(self.create_drive_panel())
 
-        left_column.addWidget(
-            self.create_servo_panel()
-        )
+        left_column.addWidget(self.create_servo_panel())
 
         # Right side
         right_column = QVBoxLayout()
 
-        right_column.addWidget(
-            self.create_sensor_panel()
-        )
+        right_column.addWidget(self.create_sensor_panel())
 
-        right_column.addWidget(
-            self.create_graph_panel()
-        )
+        right_column.addWidget(self.create_graph_panel())
 
         content.addLayout(left_column, 1)
         content.addLayout(right_column, 2)
 
         main_layout.addLayout(content)
-
-
-        # ---------------- LOG ----------------
 
         log_group = QGroupBox("System Log")
 
@@ -125,37 +130,19 @@ class GroundStation(QMainWindow):
 
         main_layout.addWidget(log_group)
 
+        stop_button = QPushButton('STOP ALL SERVOS')
 
-        # ---------------- STOP ----------------
+        stop_button.setObjectName('emergency')
 
-        stop_button = QPushButton(
-            "STOP ALL SERVOS"
-        )
+        stop_button.clicked.connect(self.stop_all)
 
-        stop_button.setObjectName(
-            "emergency"
-        )
-
-        stop_button.clicked.connect(
-            self.stop_all
-        )
-
-        main_layout.addWidget(
-            stop_button
-        )
+        main_layout.addWidget(stop_button)
 
         self.apply_style()
 
-
-    # =========================================================
-    # DRIVE PANEL
-    # =========================================================
-
     def create_drive_panel(self):
 
-        group = QGroupBox(
-            "Drive Controls"
-        )
+        group = QGroupBox('Drive Controls')
 
         layout = QGridLayout()
 
@@ -165,183 +152,65 @@ class GroundStation(QMainWindow):
         right = QPushButton("Right")
         stop = QPushButton("Stop")
 
-        forward.clicked.connect(
-            lambda:
-            self.send_command("DRIVE_FORWARD")
-        )
+        forward.clicked.connect(lambda: self.send_command('DRIVE_FORWARD'))
 
-        backward.clicked.connect(
-            lambda:
-            self.send_command("DRIVE_REVERSE")
-        )
+        backward.clicked.connect(lambda: self.send_command('DRIVE_REVERSE'))
 
-        left.clicked.connect(
-            lambda:
-            self.send_command("DRIVE_LEFT")
-        )
+        left.clicked.connect(lambda: self.send_command('DRIVE_LEFT'))
 
-        right.clicked.connect(
-            lambda:
-            self.send_command("DRIVE_RIGHT")
-        )
+        right.clicked.connect(lambda: self.send_command('DRIVE_RIGHT'))
 
-        stop.clicked.connect(
-            lambda:
-            self.send_command("DRIVE_STOP")
-        )
+        stop.clicked.connect(lambda: self.send_command('DRIVE_STOP'))
 
-        layout.addWidget(
-            forward,
-            0,
-            1
-        )
+        layout.addWidget(forward, 0, 1)
 
-        layout.addWidget(
-            left,
-            1,
-            0
-        )
+        layout.addWidget(left, 1, 0)
 
-        layout.addWidget(
-            stop,
-            1,
-            1
-        )
+        layout.addWidget(stop, 1, 1)
 
-        layout.addWidget(
-            right,
-            1,
-            2
-        )
+        layout.addWidget(right, 1, 2)
 
-        layout.addWidget(
-            backward,
-            2,
-            1
-        )
+        layout.addWidget(backward, 2, 1)
 
         group.setLayout(layout)
 
+        group.setEnabled(False)
+        group.setToolTip("Chassis control is handled separately by the mentors.")
         return group
-
-
-    # =========================================================
-    # SERVO PANEL
-    # =========================================================
 
     def create_servo_panel(self):
-
-        group = QGroupBox(
-            "Servo Controls"
-        )
-
+        group = QGroupBox("Arm target angles")
         layout = QGridLayout()
-
-        servos = [
-            "Base",
-            "Shoulder",
-            "Elbow",
-            "Wrist"
-        ]
-
-        for row, servo in enumerate(servos):
-
-            label = QLabel(servo)
-
+        for row, axis in enumerate(("Base", "Shoulder", "Elbow", "Wrist", "Gripper")):
+            angle = QDoubleSpinBox()
+            angle.setRange(0, 180)  # Preview range; real limits come from the Pico.
+            angle.setDecimals(1)
+            angle.setSuffix("°")
+            self.angle_inputs[axis] = angle
             minus = QPushButton("-")
             plus = QPushButton("+")
-
-            minus.clicked.connect(
-                lambda checked,
-                s=servo:
-                self.move_servo(s, -5)
-            )
-
-            plus.clicked.connect(
-                lambda checked,
-                s=servo:
-                self.move_servo(s, 5)
-            )
-
-            layout.addWidget(
-                label,
-                row,
-                0
-            )
-
-            layout.addWidget(
-                minus,
-                row,
-                1
-            )
-
-            layout.addWidget(
-                plus,
-                row,
-                2
-            )
-
-
-        # Gripper
-
-        gripper = QLabel(
-            "Gripper"
-        )
-
-        open_button = QPushButton(
-            "Open"
-        )
-
-        close_button = QPushButton(
-            "Close"
-        )
-
-        open_button.clicked.connect(
-            lambda:
-            self.send_command(
-                "GRIPPER_OPEN"
-            )
-        )
-
-        close_button.clicked.connect(
-            lambda:
-            self.send_command(
-                "GRIPPER_CLOSE"
-            )
-        )
-
-        layout.addWidget(
-            gripper,
-            4,
-            0
-        )
-
-        layout.addWidget(
-            open_button,
-            4,
-            1
-        )
-
-        layout.addWidget(
-            close_button,
-            4,
-            2
-        )
-
+            send = QPushButton("Set")
+            minus.clicked.connect(lambda checked, axis=axis: self.change_target(axis, -5))
+            plus.clicked.connect(lambda checked, axis=axis: self.change_target(axis, 5))
+            send.clicked.connect(lambda checked, axis=axis: self.send_angle(axis))
+            self.arm_buttons.extend([angle, minus, plus, send])
+            for column, widget in enumerate((QLabel(axis), minus, angle, plus, send)):
+                layout.addWidget(widget, row, column)
+        for widget in self.arm_buttons:
+            widget.setEnabled(False)
+        self.enable_button = QPushButton("Enable arm")
+        self.enable_button.setEnabled(False)
+        self.enable_button.clicked.connect(lambda: self.send_command("ARM_ENABLE"))
+        layout.addWidget(self.enable_button, 5, 0, 1, 5)
+        self.arm_targets = QLabel("Targets: -- (no position feedback)")
+        self.arm_targets.setWordWrap(True)
+        layout.addWidget(self.arm_targets, 6, 0, 1, 5)
         group.setLayout(layout)
-
         return group
-
-
-    # =========================================================
-    # SENSOR VALUES
-    # =========================================================
 
     def create_sensor_panel(self):
 
-        group = QGroupBox(
-            "Live Sensor Readings"
-        )
+        group = QGroupBox('Live Sensor Readings')
 
         layout = QGridLayout()
 
@@ -389,395 +258,217 @@ class GroundStation(QMainWindow):
 
         for row, (name, value) in enumerate(sensors):
 
-            layout.addWidget(
-                QLabel(name),
-                row,
-                0
-            )
+            layout.addWidget(QLabel(name), row, 0)
 
-            value.setObjectName(
-                "sensorValue"
-            )
+            value.setObjectName('sensorValue')
 
-            layout.addWidget(
-                value,
-                row,
-                1
-            )
+            layout.addWidget(value, row, 1)
 
+        self.sensor_source = QLabel("Waiting for sensor data")
+        layout.addWidget(self.sensor_source, len(sensors), 0, 1, 2)
         group.setLayout(layout)
 
         return group
-
-
-    # =========================================================
-    # GRAPHS
-    # =========================================================
 
     def create_graph_panel(self):
 
-        group = QGroupBox(
-            "Live Telemetry"
-        )
+        group = QGroupBox('Live Telemetry')
 
         layout = QVBoxLayout()
 
-
-        # ---------------- TEMPERATURE ----------------
-
         self.temp_plot = pg.PlotWidget()
 
-        self.temp_plot.setTitle(
-            "Temperature"
-        )
+        self.temp_plot.setTitle('Temperature')
 
-        self.temp_plot.setLabel(
-            "left",
-            "Temperature",
-            units="°C"
-        )
+        self.temp_plot.setLabel('left', 'Temperature', units='°C')
 
-        self.temp_plot.setLabel(
-            "bottom",
-            "Time",
-            units="s"
-        )
+        self.temp_plot.setLabel('bottom', 'Time', units='s')
 
-        self.temp_plot.showGrid(
-            x=True,
-            y=True,
-            alpha=0.2
-        )
+        self.temp_plot.showGrid(x=True, y=True, alpha=0.2)
 
-        self.temp_curve = (
-            self.temp_plot.plot(
-                pen=pg.mkPen(width=2)
-            )
-        )
+        self.temp_curve = self.temp_plot.plot(pen=pg.mkPen(width=2))
 
-        layout.addWidget(
-            self.temp_plot
-        )
-
-
-        # ---------------- PRESSURE ----------------
+        layout.addWidget(self.temp_plot)
 
         self.pressure_plot = pg.PlotWidget()
 
-        self.pressure_plot.setTitle(
-            "Pressure"
-        )
+        self.pressure_plot.setTitle('Pressure')
 
-        self.pressure_plot.setLabel(
-            "left",
-            "Pressure",
-            units="kPa"
-        )
+        self.pressure_plot.setLabel('left', 'Pressure', units='kPa')
 
-        self.pressure_plot.setLabel(
-            "bottom",
-            "Time",
-            units="s"
-        )
+        self.pressure_plot.setLabel('bottom', 'Time', units='s')
 
-        self.pressure_plot.showGrid(
-            x=True,
-            y=True,
-            alpha=0.2
-        )
+        self.pressure_plot.showGrid(x=True, y=True, alpha=0.2)
 
-        self.pressure_curve = (
-            self.pressure_plot.plot(
-                pen=pg.mkPen(width=2)
-            )
-        )
+        self.pressure_curve = self.pressure_plot.plot(pen=pg.mkPen(width=2))
 
-        layout.addWidget(
-            self.pressure_plot
-        )
-
-
-        # ---------------- ACCELERATION ----------------
+        layout.addWidget(self.pressure_plot)
 
         self.accel_plot = pg.PlotWidget()
 
-        self.accel_plot.setTitle(
-            "Acceleration"
-        )
+        self.accel_plot.setTitle('Acceleration')
 
-        self.accel_plot.setLabel(
-            "left",
-            "Acceleration",
-            units="m/s²"
-        )
+        self.accel_plot.setLabel('left', 'Acceleration', units='m/s²')
 
-        self.accel_plot.setLabel(
-            "bottom",
-            "Time",
-            units="s"
-        )
+        self.accel_plot.setLabel('bottom', 'Time', units='s')
 
-        self.accel_plot.showGrid(
-            x=True,
-            y=True,
-            alpha=0.2
-        )
+        self.accel_plot.showGrid(x=True, y=True, alpha=0.2)
 
+        self.accel_x_curve = self.accel_plot.plot(name='X')
 
-        self.accel_x_curve = (
-            self.accel_plot.plot(
-                name="X"
-            )
-        )
+        self.accel_y_curve = self.accel_plot.plot(name='Y')
 
-        self.accel_y_curve = (
-            self.accel_plot.plot(
-                name="Y"
-            )
-        )
+        self.accel_z_curve = self.accel_plot.plot(name='Z')
 
-        self.accel_z_curve = (
-            self.accel_plot.plot(
-                name="Z"
-            )
-        )
-
-
-        layout.addWidget(
-            self.accel_plot
-        )
-
+        layout.addWidget(self.accel_plot)
 
         group.setLayout(layout)
 
         return group
 
-
-    # =========================================================
-    # COMMANDS
-    # =========================================================
-
-    def send_command(
-        self,
-        command
-    ):
-
-        # ======================================
-        # ROS 2 WILL GO HERE LATER
-        # ======================================
-        #
-        # msg = String()
-        # msg.data = command
-        #
-        # self.publisher.publish(msg)
-        #
-        # ======================================
-
-        self.log(
-            f"Command sent: {command}"
-        )
-
-
-    def move_servo(
-        self,
-        servo,
-        amount
-    ):
-
-        if amount > 0:
-
-            command = (
-                f"{servo.upper()}_PLUS"
-            )
-
+    def send_command(self, request):
+        if __package__:
+            from .protocol import validate_command
         else:
+            from protocol import validate_command
+        try:
+            request = validate_command(request)
+            if self.demo:
+                command = request.get("command")
+                if command == "ARM_ENABLE":
+                    self.preview_status["enabled"] = True
+                elif command == "STOP_ALL":
+                    self.preview_status["enabled"] = False
+                elif "axis" in request and self.preview_status["enabled"]:
+                    self.preview_status["targets"][request["axis"]] = request["angle"]
+                self.log(f"UI preview: {request}")
+                self.receive_arm_status(self.preview_status)
+            else:
+                self.ros.send_command(request)
+                self.log(f"Published: {request}")
+        except (ValueError, RuntimeError) as exc:
+            self.log(str(exc))
 
-            command = (
-                f"{servo.upper()}_MINUS"
-            )
+    def send_angle(self, axis):
+        self.send_command({"axis": axis, "angle": self.angle_inputs[axis].value()})
 
-        self.send_command(
-            command
-        )
+    def receive_sensor_data(self, packet):
+        self.update_sensors(packet["data"], packet["mode"])
 
+    def receive_arm_status(self, status):
+        self.last_arm_status = status
+        ready = bool(status.get("ready"))
+        enabled = bool(status.get("enabled"))
+        mode = status.get("mode", "unknown")
+        if self.demo:
+            label = "LOCAL DEMO"
+        elif status.get("bridge_mode") == "simulation":
+            label = "ROS 2 / SIMULATION"
+        elif status.get("pico_online"):
+            label = "ROS 2 / PICO " + mode.upper()
+        else:
+            label = "ROS 2 / NO PICO REPLY"
+        self.connection.setText(label + (" / ENABLED" if enabled else " / STOPPED"))
+        for button in self.arm_buttons:
+            button.setEnabled(ready and enabled)
+        self.enable_button.setEnabled(ready and not enabled)
+        targets = status.get("targets", {})
+        for axis, values in status.get("limits", {}).items():
+            if axis in self.angle_inputs and all(isinstance(v, (int, float)) for v in values):
+                self.angle_inputs[axis].setRange(*values)
+        for axis, value in targets.items():
+            if axis in self.angle_inputs and axis not in self.target_synced:
+                self.angle_inputs[axis].setValue(value)
+                self.target_synced.add(axis)
+        self.arm_targets.setText("Targets: " + ", ".join(
+            f"{name} {angle:g}°" for name, angle in targets.items()) +
+            " (requested values, not position feedback)")
+        note = status.get("error") or status.get("sensor_error") or status.get("note", "")
+        if note and note != getattr(self, "last_note", None):
+            self.log(note)
+            self.last_note = note
+
+    def poll_ros(self):
+        self.ros.poll()
+        if not self.ros.connected():
+            self.connection.setText("NO RECENT ARM STATUS")
+            self.target_synced.clear()
+            self.enable_button.setEnabled(False)
+            for button in self.arm_buttons:
+                button.setEnabled(False)
+
+        if self.ros.last_sensors is None or time.monotonic() - self.ros.last_sensors > 2:
+            self.sensor_source.setText("No recent sensor data")
+
+    def closeEvent(self, event):
+        if self.ros is not None:
+            self.ros_timer.stop()
+            self.ros.close()
+        event.accept()
+
+    def change_target(self, axis, amount):
+        field = self.angle_inputs[axis]
+        field.setValue(field.value() + amount)
+        self.send_angle(axis)
 
     def stop_all(self):
 
-        self.send_command(
-            "STOP_ALL"
-        )
+        self.send_command('STOP_ALL')
 
-        self.log(
-            "SOFTWARE STOP ACTIVATED"
-        )
-
-
-    # =========================================================
-    # DEMO TELEMETRY
-    # =========================================================
+        self.log('Stop requested; waiting for arm status')
 
     def start_demo_telemetry(self):
 
         self.timer = QTimer()
 
-        self.timer.timeout.connect(
-            self.update_demo_sensors
-        )
+        self.timer.timeout.connect(self.update_demo_sensors)
 
         # Update every second
         self.timer.start(1000)
 
-
     def update_demo_sensors(self):
+        self.update_sensors({
+            "temperature": random.uniform(23, 26),
+            "pressure": random.uniform(100.5, 101.8),
+            "accel_x": random.uniform(-0.2, 0.2),
+            "accel_y": random.uniform(-0.2, 0.2),
+            "accel_z": random.uniform(9.7, 9.9),
+            "altitude": random.uniform(180, 182),
+        }, "simulation")
 
-        # ---------------------------------------
-        # Fake values for GUI testing
-        # ---------------------------------------
-
-        temperature = random.uniform(
-            23.0,
-            26.0
+    def update_sensors(self, data, mode):
+        self.sensor_source.setText("SIMULATED SENSOR DATA" if mode == "simulation" else "LIVE SENSOR DATA")
+        readings = (
+            ("temperature", self.temperature, "°C", 1),
+            ("pressure", self.pressure, "kPa", 2),
+            ("accel_x", self.accel_x, "m/s²", 2),
+            ("accel_y", self.accel_y, "m/s²", 2),
+            ("accel_z", self.accel_z, "m/s²", 2),
+            ("altitude", self.altitude, "m", 1),
         )
-
-        pressure = random.uniform(
-            100.5,
-            101.8
-        )
-
-        accel_x = random.uniform(
-            -0.20,
-            0.20
-        )
-
-        accel_y = random.uniform(
-            -0.20,
-            0.20
-        )
-
-        accel_z = random.uniform(
-            9.70,
-            9.90
-        )
-
-        altitude = random.uniform(
-            180.0,
-            182.0
-        )
-
-
-        # ---------------------------------------
-        # Update numbers
-        # ---------------------------------------
-
-        self.temperature.setText(
-            f"{temperature:.1f} °C"
-        )
-
-        self.pressure.setText(
-            f"{pressure:.2f} kPa"
-        )
-
-        self.accel_x.setText(
-            f"{accel_x:.2f} m/s²"
-        )
-
-        self.accel_y.setText(
-            f"{accel_y:.2f} m/s²"
-        )
-
-        self.accel_z.setText(
-            f"{accel_z:.2f} m/s²"
-        )
-
-        self.altitude.setText(
-            f"{altitude:.1f} m"
-        )
-
-
-        # ---------------------------------------
-        # Save graph history
-        # ---------------------------------------
-
-        self.counter += 1
-
-        self.time_data.append(
-            self.counter
-        )
-
-        self.temp_data.append(
-            temperature
-        )
-
-        self.pressure_data.append(
-            pressure
-        )
-
-        self.accel_x_data.append(
-            accel_x
-        )
-
-        self.accel_y_data.append(
-            accel_y
-        )
-
-        self.accel_z_data.append(
-            accel_z
-        )
-
-
-        # ---------------------------------------
-        # Update graphs
-        # ---------------------------------------
-
-        self.temp_curve.setData(
-            list(self.time_data),
-            list(self.temp_data)
-        )
-
-        self.pressure_curve.setData(
-            list(self.time_data),
-            list(self.pressure_data)
-        )
-
-        self.accel_x_curve.setData(
-            list(self.time_data),
-            list(self.accel_x_data)
-        )
-
-        self.accel_y_curve.setData(
-            list(self.time_data),
-            list(self.accel_y_data)
-        )
-
-        self.accel_z_curve.setData(
-            list(self.time_data),
-            list(self.accel_z_data)
-        )
-
-
-    # =========================================================
-    # LOG
-    # =========================================================
+        for key, label, unit, decimals in readings:
+            value = data.get(key)
+            label.setText(f"{value:.{decimals}f} {unit}" if value is not None else f"-- {unit}")
+        self.time_data.append(time.monotonic() - self.started)
+        for key, history, curve in (
+            ("temperature", self.temp_data, self.temp_curve),
+            ("pressure", self.pressure_data, self.pressure_curve),
+            ("accel_x", self.accel_x_data, self.accel_x_curve),
+            ("accel_y", self.accel_y_data, self.accel_y_curve),
+            ("accel_z", self.accel_z_data, self.accel_z_curve),
+        ):
+            value = data.get(key)
+            history.append(value if value is not None else float("nan"))
+            curve.setData(list(self.time_data), list(history))
 
     def log(
         self,
         message
     ):
 
-        current_time = (
-            datetime.now().strftime(
-                "%H:%M:%S"
-            )
-        )
+        current_time = datetime.now().strftime('%H:%M:%S')
 
-        self.log_box.append(
-            f"[{current_time}] {message}"
-        )
-
-
-    # =========================================================
-    # STYLING
-    # =========================================================
+        self.log_box.append(f'[{current_time}] {message}')
 
     def apply_style(self):
 
@@ -911,21 +602,27 @@ class GroundStation(QMainWindow):
 
         """)
 
-
-# =============================================================
-# START APPLICATION
-# =============================================================
+def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="Rover arm ground station")
+    parser.add_argument("--demo", action="store_true", help="Local preview, no ROS 2")
+    args, _ = parser.parse_known_args()
+    ros = None
+    if not args.demo:
+        try:
+            import rclpy as ros
+        except ImportError:
+            raise SystemExit("Source your ROS 2 installation, or run with --demo for a local preview.")
+        ros.init(args=None)
+    app = QApplication(sys.argv)
+    try:
+        window = GroundStation(demo=args.demo)
+        window.show()
+        result = app.exec_()
+    finally:
+        if ros is not None and ros.ok():
+            ros.shutdown()
+    return result
 
 if __name__ == "__main__":
-
-    app = QApplication(
-        sys.argv
-    )
-
-    window = GroundStation()
-
-    window.show()
-
-    sys.exit(
-        app.exec_()
-    )
+    sys.exit(main())
